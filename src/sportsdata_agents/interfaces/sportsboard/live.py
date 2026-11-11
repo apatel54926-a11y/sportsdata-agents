@@ -1,0 +1,157 @@
+"""Self-contained live mode for the sports board.
+
+Runs the ingestion poll loop *in-process* so the server fetches live prices into
+its own store and serves them directly — no external ``agents ingest`` process and
+(with an ephemeral SQLite url) no durable warehouse. This is the racing board's
+in-process-poller model applied to sports: one process = a live board.
+
+Opt-in via ``SPORTSBOARD_LIVE=1`` (see deploy/serve_live.sh, deploy/render.yaml).
+Default off, so the plain server stays a pure warehouse reader — the static build
+and the tests are unaffected. The money-flow window fills over the first few
+minutes as snapshots accumulate, exactly like the racing board on a cold start.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import datetime as dt
+import logging
+import os
+
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+logger = logging.getLogger("sportsboard.live")
+
+_TRUTHY = {"1", "true", "yes", "on"}
+_RESOLVE_EVERY_S = 60.0  # cross-provider fixture resolution cadence (DB-only, no MCP)
+# Each tick examines only snapshots captured since the PREVIOUS tick started,
+# less this slack (a feed that committed while the last tick was mid-scan lands
+# in the next one). The priming pass looks back this far — enough to cover a
+# restart's downtime, no more. A live event is recaptured every cycle, so any
+# key still worth mapping re-enters a later tick's window on its own; one that
+# stopped being captured is not on the board. 48h was tried first and fetched
+# 7M of 14M rows by index — slower than the full scan it replaced.
+# See resolve_events(since=).
+_RESOLVE_SLACK_S = 2 * _RESOLVE_EVERY_S
+_RESOLVE_PRIME_LOOKBACK_S = 15 * 60.0
+
+# The live poller's MCP manager while it runs, None otherwise. sgm_books.py
+# borrows it for book SGM quotes; a warehouse-only server (live mode off)
+# therefore reports book quoting as unavailable rather than spawning its own.
+current_manager = None
+
+
+def live_enabled() -> bool:
+    """Whether the in-process live poller should run (SPORTSBOARD_LIVE)."""
+    return os.environ.get("SPORTSBOARD_LIVE", "").strip().lower() in _TRUTHY
+
+
+async def _monitor_loop(sf, every_s: float = 300.0) -> None:
+    from sportsdata_agents.operations.monitoring import run_watches
+    while True:
+        await asyncio.sleep(every_s)
+        try:
+            report = await run_watches(sf)
+            if report.get("alerts"):
+                logger.info("monitor: %s alerts across %s watches",
+                            report["alerts"], report["subscriptions"])
+        except Exception:  # a watch failure must never take the poller down
+            logger.exception("monitor pass failed")
+
+
+async def _resolve_loop(sf: async_sessionmaker[AsyncSession]) -> None:
+    """Re-link each provider's events into shared fixtures on a fixed cadence
+    (DB-only — no MCP), so newly-ingested games join the board."""
+    from sportsdata_agents.operations.resolution import resolve_events
+
+    prev_started = dt.datetime.now(dt.UTC)  # the priming pass has just run
+    while True:
+        await asyncio.sleep(_RESOLVE_EVERY_S)
+        started = dt.datetime.now(dt.UTC)
+        try:
+            await resolve_events(
+                sf, since=prev_started - dt.timedelta(seconds=_RESOLVE_SLACK_S))
+            prev_started = started  # a failed tick leaves the window open for the next
+        except Exception:
+            logger.exception("resolve tick failed")
+
+
+async def run_poller() -> None:
+    """Prime once, then run the per-feed ingestion loop against the board's store.
+
+    Reads the same ``database_url`` the reader serves from, so the loop and the API
+    share one store. Any failure (no MCP, no network) is logged, not fatal — the
+    board just serves an empty/thin slate until upstreams recover.
+    """
+    from sportsdata_agents.config import get_settings
+    from sportsdata_agents.data.base import Base
+    from sportsdata_agents.data.db import make_engine, make_sessionmaker
+    from sportsdata_agents.mcp.manager import MCPManager
+    from sportsdata_agents.operations.ingestion import ingest_once, run_loop
+    from sportsdata_agents.operations.ingestion.worker import INGEST_MAX_BYTES, tuned_feeds
+    from sportsdata_agents.operations.resolution import resolve_events
+    from sportsdata_agents.tools.ops import disabled_feeds
+
+    settings = get_settings()
+    feeds = [f for f in tuned_feeds() if f.name not in disabled_feeds()]
+    # optional allow-list (SPORTSBOARD_LIVE_FEEDS="pinnacle,betfair") — run a lean
+    # board, or scope a smoke test to one feed instead of the full book blast.
+    only = {n.strip() for n in os.environ.get("SPORTSBOARD_LIVE_FEEDS", "").split(",") if n.strip()}
+    if only:
+        feeds = [f for f in feeds if f.name in only]
+    # optional exclude patterns (SPORTSBOARD_LIVE_FEEDS_EXCLUDE="*_racing*"):
+    # keeps the every-feed default (new books ship automatically) while carving
+    # out families another process owns — e.g. a co-located racing board doing
+    # its own TAB polling, which these feeds would double up against the same
+    # rate-limited upstream.
+    import fnmatch
+    exclude = [p.strip() for p in os.environ.get("SPORTSBOARD_LIVE_FEEDS_EXCLUDE", "").split(",") if p.strip()]
+    if exclude:
+        feeds = [f for f in feeds if not any(fnmatch.fnmatch(f.name, p) for p in exclude)]
+    if not feeds:
+        logger.warning("live mode: no enabled feeds — nothing to poll")
+        return
+    groups = sorted({g for f in feeds for g in f.mcp_groups}
+                    # sgm_books.py prices same-game multis through the books;
+                    # the pricers live in groups no ingestion feed mounts.
+                    | {"sportsbet.cross"})
+
+    engine = make_engine(settings.database_url)
+    try:
+        async with engine.begin() as conn:  # additive + idempotent (SQLite/ephemeral live store)
+            await conn.run_sync(Base.metadata.create_all)
+        sf = make_sessionmaker(engine)
+        # ETL has no model context window to protect — lift the MCP byte cap (AU book
+        # payloads are MB-scale; see INGEST_MAX_BYTES).
+        async with MCPManager(
+            groups=groups,
+            command=settings.mcp_command,
+            extra_env={"SPORTSDATA_MCP_MAX_BYTES": str(INGEST_MAX_BYTES)},
+        ) as manager:
+            # Published for /api/sgm's book-quote path (sgm_books.py): a quote
+            # is one or two tool calls, not worth a second data-plane process.
+            global current_manager
+            current_manager = manager
+            # prime: one capture, then link each provider's events into fixtures so
+            # the board can blend the sharp line across books for a single game.
+            logger.info("live mode: priming %d feeds …", len(feeds))
+            await ingest_once(manager, sf, feeds)
+            await resolve_events(
+                sf, since=dt.datetime.now(dt.UTC)
+                - dt.timedelta(seconds=_RESOLVE_PRIME_LOOKBACK_S))
+            logger.info("live mode: entering poll + resolve loops")
+            loops = [run_loop(manager, sf, feeds), _resolve_loop(sf)]
+            if os.environ.get("SPORTSBOARD_MONITOR", "").strip().lower() in _TRUTHY:
+                # The watches ride IN-PROCESS on a co-located SQLite deploy:
+                # as a separate process they fight the continuous ingest for
+                # the single write lock and starve (lived, 2026-08-27: every
+                # cross-process pass died on "database is locked" despite the
+                # 120s busy timeout). In here their writes serialize through
+                # the same engine, like resolve's do.
+                loops.append(_monitor_loop(sf))
+            await asyncio.gather(*loops)
+    except Exception:  # a live-poll failure must never take the server down
+        logger.exception("live poller stopped")
+    finally:
+        current_manager = None
+        await engine.dispose()

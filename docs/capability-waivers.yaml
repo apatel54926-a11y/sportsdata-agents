@@ -1,0 +1,98 @@
+# Why a published capability is not wired to any agent.
+#
+# `scripts/capability-audit.py --check` fails when a capability the data plane publishes
+# is neither granted by an agent nor listed here. That is the whole point: 31 of 68
+# capabilities went dark because nothing ever forced anyone to notice them, and a
+# backfill without this file would simply restart the drift.
+#
+# status:
+#   planned    — we intend to wire it; `phase` says when. Not an excuse, a queue.
+#   redundant  — another wired capability already returns a superset of this data.
+#   niche      — real, but not worth an agent's context budget. The honest end state
+#                for some of these; a waiver with a reason beats a grant nobody uses.
+#   upstream   — declared by the data plane but exposed by no tool there.
+#
+# Deleting an entry is how you promote it: the audit then demands it be wired.
+#
+# `generated_from` is the data-plane version this file and capability_labels.json were
+# built against. It exists to separate two things the audit would otherwise confuse:
+#   DRIFT — upstream renamed or dropped a tag an agent depends on. A real failure.
+#   SKEW  — this repo is ahead of the RELEASED data plane, because a capability was
+#           added to sportsdata-mcp and not published yet. Temporary and expected: the
+#           two repos version independently and CI installs the released wheel.
+# Skew is reported, never failed. It resolves itself the moment the data plane ships.
+generated_from: "0.29.0"
+
+waivers:
+  # ── planned: discovery (phase 5) ─────────────────────────────────────
+
+  # ── planned: player depth (phase 5) ──────────────────────────────────
+
+  # ── planned: roster intelligence + backtesting (phase 5) ─────────────
+  stats.closing_odds:
+    status: planned
+    phase: 7
+    reason: >-
+      Moved out of phase 5: this is not an agent grant. CLV is benchmarked in
+      quant/backtest.py against Price rows in the WAREHOUSE, so a capability an agent can
+      call ad hoc feeds nothing — the closes have to be ingested. That makes it pipeline
+      work alongside in-play capture, not a line in a spec. Provenance must be labelled
+      when it lands: a third-party close and a self-captured one must never be silently
+      mixed in the same CLV figure.
+
+  # ── redundant ────────────────────────────────────────────────────────
+  sport.match_detail:
+    status: redundant
+    reason: >-
+      A strict subset of sport.match_boxscore, which stats_specialist already grants.
+      Wiring both would spend context on two routes to the same payload.
+  sport.rankings:
+    status: redundant
+    reason: >-
+      Ladder-shaped data already covered by stats.ladder for team sports. The individual
+      ranking sports it adds (chess, tennis, UFC) have no engine, so nothing consumes it.
+  sport.season_summary:
+    status: redundant
+    reason: Aggregates derivable from stats.team_season, which modelling and data_analysis already hold.
+
+  # ── niche: real data, not worth the context budget ───────────────────
+  broadcast.channels:
+    status: niche
+    reason: Channel catalogue. No agent question routes through it; advisory platform, not a TV guide.
+  broadcast.schedule:
+    status: niche
+    reason: As broadcast.channels. Revisit only if a user-facing "where can I watch" surface appears.
+  content.video:
+    status: niche
+    reason: Editorial video. An LLM agent cannot watch it, and the metadata adds nothing a text feed lacks.
+  content.promo:
+    status: niche
+    reason: Bookmaker marketing cards. Deliberately not surfaced — the platform is advisory, not a funnel.
+  sport.live_audio:
+    status: niche
+    reason: Audio streams; nothing in the pipeline consumes audio.
+  sport.live_video:
+    status: niche
+    reason: Video streams; as sport.live_audio.
+  stats.shot_chart:
+    status: niche
+    reason: >-
+      NBA only, and spatial data needs a consumer that does not exist. Genuine candidate
+      if a basketball-specific modelling surface is ever built.
+
+  # ── added by Phase 1 (tagging the orphans), not yet wired ────────────
+  sport.awards:
+    status: niche
+    reason: >-
+      Award winners are trivia here. No model consumes them and no market prices them
+      on the two providers that carry it.
+  content.photo:
+    status: niche
+    reason: Photo assets. As content.video — an LLM agent cannot use the image.
+
+  # ── upstream placeholder ─────────────────────────────────────────────
+  sport.example:
+    status: upstream
+    reason: >-
+      Declared in the data plane's _capabilities.yaml but exposed by no tool there. It is
+      a schema example, not a real capability. Nothing to wire until upstream drops it.

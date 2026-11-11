@@ -1,0 +1,120 @@
+{
+  "period_s": 60,
+  "cases": [
+    {
+      "now": "2026-06-16T10:01:30",
+      "due": [
+        "ingest",
+        "monitor"
+      ]
+    },
+    {
+      "now": "2026-06-16T10:05:30",
+      "due": [
+        "ingest",
+        "monitor"
+      ]
+    },
+    {
+      "now": "2026-06-12T23:30:30",
+      "due": [
+        "fantasy",
+        "form",
+        "ingest",
+        "monitor",
+        "resolve",
+        "slate"
+      ]
+    },
+    {
+      "now": "2026-06-12T23:40:30",
+      "due": [
+        "ingest",
+        "monitor",
+        "resolve",
+        "results"
+      ]
+    },
+    {
+      "now": "2026-06-15T09:00:30",
+      "due": [
+        "budget_watch",
+        "custodian",
+        "fantasy",
+        "form",
+        "ingest",
+        "monitor",
+        "resolve",
+        "slate",
+        "steward"
+      ]
+    },
+    {
+      "now": "2026-06-15T09:30:30",
+      "due": [
+        "eval_benchmark",
+        "fantasy",
+        "form",
+        "ingest",
+        "monitor",
+        "resolve",
+        "slate"
+      ]
+    },
+    {
+      "now": "2026-06-15T10:00:30",
+      "due": [
+        "budget_watch",
+        "custodian",
+        "fantasy",
+        "form",
+        "ingest",
+        "monitor",
+        "resolve",
+        "site_manager",
+        "slate"
+      ]
+    },
+    {
+      "now": "2026-06-14T06:00:30",
+      "due": [
+        "budget_watch",
+        "custodian",
+        "fantasy",
+        "form",
+        "ingest",
+        "monitor",
+        "refresh_books",
+        "resolve",
+        "slate"
+      ]
+    },
+    {
+      "now": "2026-06-14T07:00:30",
+      "due": [
+        "budget_watch",
+        "custodian",
+        "fantasy",
+        "form",
+        "ingest",
+        "monitor",
+        "ops_health",
+        "resolve",
+        "slate"
+      ]
+    },
+    {
+      "now": "2026-06-16T09:00:30",
+      "due": [
+        "budget_watch",
+        "custodian",
+        "fantasy",
+        "form",
+        "ingest",
+        "monitor",
+        "resolve",
+        "slate"
+      ]
+    }
+  ]
+}

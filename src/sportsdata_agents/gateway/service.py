@@ -1,0 +1,277 @@
+"""Channel-agnostic team session (the seam Slack/web reuse later, M1.1/M1.2).
+
+``TeamSession`` owns everything a channel needs: specs, the model gateway, the MCP
+session pool, optional audit recording, and the opened team (or a single agent).
+Channels stay thin: open a session, feed it prompts, render ``RunResult``s.
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Sequence
+from contextlib import AsyncExitStack
+from types import TracebackType
+from typing import Any, Self
+
+from sportsdata_agents.agents.harness import CompletionProvider, RunResult
+from sportsdata_agents.agents.loader import load_builtin_specs
+from sportsdata_agents.agents.runtime import AgentRuntime, open_team
+from sportsdata_agents.agents.spec import AgentSpec
+from sportsdata_agents.config import Settings, get_settings
+from sportsdata_agents.data.repository import TenantScope
+from sportsdata_agents.mcp.pool import MCPSessionPool
+from sportsdata_agents.models.gateway import ModelGateway
+from sportsdata_agents.observability.recorder import DbRecorder, RunRecorder
+from sportsdata_agents.workspace import Workspace, default_workspace
+
+logger = logging.getLogger(__name__)
+
+
+# Provider detection (BYO-LLM, §8.1): the first configured key wins. None = the
+# policy's default tiers already work (Anthropic primary). A single OpenRouter /
+# Gemini / Groq key pins every tier to that provider's model.
+_PROVIDER_KEYS: list[tuple[str, str | None]] = [
+    ("ANTHROPIC_API_KEY", None),
+    ("OPENROUTER_API_KEY", "openrouter/openai/gpt-4o-mini"),
+    ("GEMINI_API_KEY", "gemini/gemini-2.5-flash-lite"),  # free tier, tool-calling
+    ("GROQ_API_KEY", "groq/openai/gpt-oss-120b"),  # free tier; strong tool-calling
+    ("OPENAI_API_KEY", "openai/gpt-4o-mini"),
+]
+
+
+def detect_tier_overrides() -> dict[str, str]:
+    """Workspace ``model_tiers`` overrides for whichever model key is configured."""
+    import os
+
+    for env_name, model in _PROVIDER_KEYS:
+        if os.environ.get(env_name):
+            if model is None:
+                return {}
+            return {"fast": model, "balanced": model, "strong": model}
+    return {}
+
+
+def has_model_key() -> bool:
+    """True when any supported model-provider key is configured (BYO-LLM, §8.1)."""
+    import os
+
+    return any(os.environ.get(env_name) for env_name, _ in _PROVIDER_KEYS)
+
+
+async def try_db_recorder(settings: Settings, scope: TenantScope) -> DbRecorder | None:
+    """A DbRecorder when the database actually accepts a connection; None (with ONE
+    warning) otherwise — the CLI must work without Postgres running, just without
+    audit rows. The probe matters: the sessionmaker is lazy and 'succeeds' even when
+    the DB is down, which would otherwise surface as guarded-hook warning spam on
+    every run instead of a single clear notice."""
+    try:
+        from sportsdata_agents.data.db import get_engine, get_sessionmaker
+
+        engine = get_engine()
+        async with engine.connect():
+            pass
+        return DbRecorder(get_sessionmaker(), scope)
+    except Exception as e:
+        logger.warning("audit disabled — database unavailable (%s: %s)", type(e).__name__, e)
+        return None
+
+
+class TeamSession:
+    """One opened team (or single agent), ready to answer prompts."""
+
+    def __init__(
+        self,
+        *,
+        settings: Settings | None = None,
+        workspace: Workspace | None = None,
+        specs: dict[str, AgentSpec] | None = None,
+        provider: CompletionProvider | None = None,
+        recorder: RunRecorder | None = None,
+        extra_tools: Sequence[Any] | None = None,
+        agent_id: str | None = None,
+        root_id: str = "orchestrator",
+        mcp_command: Sequence[str] | None = None,
+        allow_ops: bool = False,  # ONLY the operator CLI sets this (§3.1)
+    ) -> None:
+        self.settings = settings or get_settings()
+        self.workspace = workspace or default_workspace(self.settings)
+        if specs is not None:
+            self.specs = specs
+        else:
+            self.specs = load_builtin_specs()
+            from sportsdata_agents.agents.loader import load_specs_dir
+            from sportsdata_agents.tools.builder import user_specs_dir
+
+            user_dir = user_specs_dir()
+            if any(user_dir.glob("*.y*ml")):  # user-built agents merge on top (§7.1)
+                for user_id, user_spec in load_specs_dir(user_dir).items():
+                    self.specs.setdefault(user_id, user_spec)  # builtins never shadowed
+            if self.workspace.agent_versions:  # D27: pinned workspaces keep archives
+                from sportsdata_agents.agents.loader import (
+                    builtin_specs_dir,
+                    load_spec_catalog,
+                    resolve_pins,
+                )
+
+                self.specs = resolve_pins(
+                    load_spec_catalog(builtin_specs_dir()),
+                    self.specs,
+                    self.workspace.agent_versions,
+                )
+        # P4 entitlements: the paid tier scopes which PRODUCT agents the team
+        # offers (ops agents are never gated — they're the platform's own crew).
+        from sportsdata_agents.licensing.enforce import filter_roster
+
+        self.specs = filter_roster(self.specs, root_id)
+        for spec in self.specs.values():
+            if spec.deprecated:
+                logger.warning("agent %s@%s is deprecated: %s", spec.id, spec.version, spec.deprecated)
+        self.recorder = recorder
+        usage_sink = getattr(recorder, "usage_sink", None) if recorder is not None else None
+        # When the warehouse is up, enforce the operator's daily/weekly/monthly budget
+        # at the model-call chokepoint — the OUTER ceiling above each run's RunBudget.
+        spend_guard = None
+        inner = getattr(recorder, "inner", recorder)
+        session_factory = getattr(inner, "session_factory", None)
+        if session_factory is not None:
+            from sportsdata_agents.operations.budget_guard import PeriodBudgetGuard
+
+            spend_guard = PeriodBudgetGuard(session_factory)
+        self.provider = provider or ModelGateway(usage_sink=usage_sink, spend_guard=spend_guard)
+        self._extra_tools = list(extra_tools) if extra_tools is not None else _default_extra_tools(recorder)
+        self.agent_id = agent_id
+        self.root_id = root_id
+        self._mcp_command = list(mcp_command) if mcp_command else list(self.settings.mcp_command)
+        self._stack: AsyncExitStack | None = None
+        self._runtime: AgentRuntime | None = None
+        # §3.1 hard split: the customer gateway can never open an ops-plane agent —
+        # enforced HERE in infrastructure, not in prompts. The operator CLI is the
+        # only caller that passes allow_ops.
+        if not allow_ops:
+            if agent_id is not None and agent_id in self.specs and self.specs[agent_id].plane == "ops":
+                raise PermissionError(
+                    f"{agent_id!r} is an ops-plane agent — reachable only via `agents ops` (§3.1)"
+                )
+            self.specs = {k: s for k, s in self.specs.items() if s.plane != "ops"}
+
+    @property
+    def agent_name(self) -> str:
+        return self.agent_id or self.root_id
+
+    async def __aenter__(self) -> Self:
+        self._stack = AsyncExitStack()
+        try:
+            pool = await self._stack.enter_async_context(MCPSessionPool(command=self._mcp_command))
+            if self.agent_id is not None:
+                if self.agent_id not in self.specs:
+                    raise KeyError(f"unknown agent {self.agent_id!r}; loaded: {sorted(self.specs)}")
+                self._runtime = await self._stack.enter_async_context(
+                    AgentRuntime(
+                        self.specs[self.agent_id],
+                        provider=self.provider,
+                        workspace=self.workspace,
+                        pool=pool,
+                        extra_tools=self._extra_tools,
+                        recorder=self.recorder,
+                    )
+                )
+            else:
+                self._runtime = await self._stack.enter_async_context(
+                    open_team(
+                        self.specs,
+                        self.root_id,
+                        provider=self.provider,
+                        workspace=self.workspace,
+                        pool=pool,
+                        extra_tools=self._extra_tools,
+                        recorder=self.recorder,
+                    )
+                )
+        except BaseException:
+            await self._stack.aclose()
+            self._stack = None
+            raise
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        if self._stack is not None:
+            await self._stack.aclose()
+            self._stack = None
+            self._runtime = None
+
+    async def run(
+        self,
+        prompt: str,
+        *,
+        recorder: RunRecorder | None = None,
+        tier: str | None = None,
+        mcp_deny: frozenset[str] | None = None,
+    ) -> RunResult:
+        """``recorder`` overrides recording for this run only (e.g. the gateway's SSE
+        mirror) — contextvar-scoped in the harness, so concurrent runs don't race.
+        ``tier``/``mcp_deny`` are the conversation's settings (workbench B2): the
+        forced model and the scoped-out providers for THIS run — same contextvar
+        propagation, so delegated sub-runs inherit both."""
+        if self._runtime is None:
+            raise RuntimeError("TeamSession is not started; use `async with TeamSession(...)`")
+        from sportsdata_agents.agents.harness import CURRENT_CONV_TIER, CURRENT_MCP_DENY
+
+        tier_token = CURRENT_CONV_TIER.set(tier) if tier else None
+        deny_token = CURRENT_MCP_DENY.set(mcp_deny) if mcp_deny else None
+        try:
+            return await self._runtime.run(prompt, recorder=recorder)
+        finally:
+            if tier_token is not None:
+                CURRENT_CONV_TIER.reset(tier_token)
+            if deny_token is not None:
+                CURRENT_MCP_DENY.reset(deny_token)
+
+
+def _default_extra_tools(recorder: RunRecorder | None) -> list[Any]:
+    """Session-bound tools: tracking/memory when the DB is up (M1.4/M1.5),
+    slack admin when SLACK_BOT_TOKEN is configured (slack_manager). Anything
+    absent degrades to the actionable config stub in the runtime."""
+    import os
+
+    from sportsdata_agents.observability.recorder import DbRecorder
+
+    tools: list[Any] = []
+    inner = getattr(recorder, "inner", recorder)
+    if isinstance(inner, DbRecorder):
+        from sportsdata_agents.tools.arbitrage import arbitrage_tools
+        from sportsdata_agents.tools.dictionary import dictionary_tools
+        from sportsdata_agents.tools.memory import memory_tools
+        from sportsdata_agents.tools.monitoring import monitoring_tools
+        from sportsdata_agents.tools.quant import quant_tools
+        from sportsdata_agents.tools.resolution import resolution_tools
+        from sportsdata_agents.tools.tracking import tracking_tools
+
+        tools += [
+            *tracking_tools(inner.session_factory, inner.scope),
+            *memory_tools(inner.session_factory, inner.scope),
+            *quant_tools(inner.session_factory, inner.scope),
+            *dictionary_tools(inner.session_factory),
+            *resolution_tools(inner.session_factory),
+            *monitoring_tools(inner.session_factory, inner.scope),
+            *arbitrage_tools(inner.session_factory),
+        ]
+    if os.environ.get("SLACK_BOT_TOKEN"):
+        from sportsdata_agents.tools.slack_admin import slack_admin_tools
+
+        tools += slack_admin_tools()
+    from sportsdata_agents.tools.builder import builder_tools
+
+    tools += builder_tools()  # DB-free: drafting/saving specs works everywhere
+    return tools
+
+
+def parsed_sources(result: RunResult) -> list[str]:
+    """Sources from a typed output, when present (for channel rendering)."""
+    parsed: Any = result.parsed
+    sources = getattr(parsed, "sources", None)
+    return list(sources) if isinstance(sources, list) else []

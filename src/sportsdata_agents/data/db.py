@@ -1,0 +1,277 @@
+"""Async database engine + session helpers (SQLAlchemy 2.0).
+
+The app uses one lazily-created engine from ``Settings.database_url`` (async driver:
+asyncpg for Postgres, aiosqlite for tests). Tests build their own engine/session, so the
+module global stays out of their way.
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+from sqlalchemy.engine import Connection
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+
+from sportsdata_agents.config import get_settings
+
+_engine: AsyncEngine | None = None
+_sessionmaker: async_sessionmaker[AsyncSession] | None = None
+
+
+def make_engine(url: str) -> AsyncEngine:
+    """Create an async engine for ``url`` (driver imported lazily on first connect).
+
+    SQLite gets a busy timeout: the cron'd ingest writes every few minutes, and a
+    single-writer database must make concurrent writers WAIT, not fail with
+    'database is locked' (interim until the P3 Postgres move). 120s because an
+    ingest batch commit on a multi-GB warehouse can hold the write lock well
+    past 30s (lived: the slate recorder lost the race on its first live run)."""
+    kwargs: dict[str, object] = {"pool_pre_ping": True, "future": True}
+    if url.startswith("sqlite"):
+        kwargs["connect_args"] = {"timeout": 120}
+    engine = create_async_engine(url, **kwargs)
+    if url.startswith("sqlite"):
+        # WAL is load-bearing, not a nicety: ingest (a ~60s writer) and monitor
+        # (a ~60s reader) are SEPARATE processes. In the default DELETE mode
+        # every commit takes an exclusive lock that blocks readers and vice
+        # versa — both jobs burned a large share of their 60s budget waiting
+        # (measured: ingest 68s, "database is locked" on a bare count), and the
+        # custodian's wal_checkpoint already ASSUMED WAL that was never on.
+        # synchronous=NORMAL is safe under WAL (a crash loses at most the last
+        # commit, never corrupts) and drops a full fsync per commit.
+        from sqlalchemy import event
+
+        @event.listens_for(engine.sync_engine, "connect")
+        def _sqlite_pragmas(dbapi_conn, _rec):
+            cur = dbapi_conn.cursor()
+            cur.execute("PRAGMA journal_mode=WAL")
+            cur.execute("PRAGMA synchronous=NORMAL")
+            cur.execute("PRAGMA busy_timeout=120000")
+            # Cap the WAL. Without this the sports warehouse ran to 22 GB
+            # against a 14 GB database, ~850 MB/minute, and came within about
+            # three hours of filling the root disk on 1 Sep 2026.
+            #
+            # The subtlety is WHY the hourly wal_checkpoint(TRUNCATE) could not
+            # save it: TRUNCATE needs an exclusive moment, and the collectors
+            # write continuously, so it returned busy every hour for three
+            # hours while a PASSIVE checkpoint was meanwhile copying 4.9M pages
+            # out just fine. Pages were landing in the db; the FILE just never
+            # got reset, because resetting is the part that needs the lock.
+            #
+            # journal_size_limit needs no such lock. It is applied whenever a
+            # checkpoint completes, so the routine autocheckpoint that already
+            # runs constantly now also trims the file back to this bound. That
+            # turns an unbounded sawtooth into a ceiling.
+            cur.execute("PRAGMA journal_size_limit=536870912")   # 512 MB
+            cur.close()
+
+    # SPORTSDATA_AGENTS_SLOW_SQL_MS=<n>: warn for any statement that takes
+    # longer than n ms, with its text. On a single-writer SQLite warehouse a
+    # slow statement inside a transaction IS the write-lock hold every other
+    # connection is timing out on, and nothing outside the process can name it
+    # (the busy handler only ever reports the victims). Off by default.
+    import os
+
+    slow_ms = int(os.environ.get("SPORTSDATA_AGENTS_SLOW_SQL_MS", "0") or 0)
+    if slow_ms > 0:
+        import logging
+        import time
+
+        from sqlalchemy import event
+
+        log = logging.getLogger(__name__)
+
+        _DML = ("INSERT", "UPDATE", "DELETE", "REPLACE")
+
+        @event.listens_for(engine.sync_engine, "before_cursor_execute")
+        def _sql_started(conn, cursor, statement, parameters, context, executemany):
+            conn.info["_sql_started"] = time.monotonic()
+            # The first write of a transaction is when SQLite's write lock is
+            # taken; name it, so a transaction that then sits on the lock
+            # across many fast statements (or an await) can be attributed.
+            if "_txn_first_write" not in conn.info and statement.lstrip()[:7].upper().startswith(_DML):
+                conn.info["_txn_first_write"] = (time.monotonic(), " ".join(statement.split())[:160])
+
+        def _txn_ended(conn, how):
+            first = conn.info.pop("_txn_first_write", None)
+            if first is None:
+                return
+            held_ms = (time.monotonic() - first[0]) * 1000
+            if held_ms >= slow_ms:
+                log.warning("write lock held %.0fms until %s; first write: %s", held_ms, how, first[1])
+
+        @event.listens_for(engine.sync_engine, "commit")
+        def _txn_commit(conn):
+            _txn_ended(conn, "commit")
+
+        @event.listens_for(engine.sync_engine, "rollback")
+        def _txn_rollback(conn):
+            _txn_ended(conn, "rollback")
+
+        @event.listens_for(engine.sync_engine, "after_cursor_execute")
+        def _sql_finished(conn, cursor, statement, parameters, context, executemany):
+            started = conn.info.pop("_sql_started", None)
+            if started is None:
+                return
+            took_ms = (time.monotonic() - started) * 1000
+            if took_ms >= slow_ms:
+                rows = len(parameters) if executemany and hasattr(parameters, "__len__") else 1
+                log.warning("slow sql %.0fms (%d row%s): %s", took_ms, rows,
+                            "" if rows == 1 else "s", " ".join(statement.split())[:240])
+
+    return engine
+
+
+def make_sessionmaker(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
+    return async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+
+def get_engine() -> AsyncEngine:
+    """The cached application engine (built from settings on first use)."""
+    global _engine
+    if _engine is None:
+        _engine = make_engine(get_settings().database_url)
+    return _engine
+
+
+def get_sessionmaker() -> async_sessionmaker[AsyncSession]:
+    global _sessionmaker
+    if _sessionmaker is None:
+        _sessionmaker = make_sessionmaker(get_engine())
+    return _sessionmaker
+
+
+def _add_missing_columns(conn: Connection) -> None:
+    """Additively reconcile EXISTING SQLite tables with the ORM models: for every
+    mapped column a table is missing, ``ALTER TABLE … ADD COLUMN``. SQLite's
+    ``create_all`` only adds whole tables, so without this a model that grew a column
+    (e.g. ``conversations.archived``) would break queries against an older warehouse.
+    Only additive, only nullable or constant-default'd columns — never drops, retypes,
+    or touches keys. Each ALTER is independent; one failure can't block the rest."""
+    import logging
+
+    from sqlalchemy import inspect
+
+    from sportsdata_agents.data.base import Base
+
+    log = logging.getLogger(__name__)
+    insp = inspect(conn)
+    existing = set(insp.get_table_names())
+    for table in Base.metadata.sorted_tables:
+        if table.name not in existing:
+            continue  # create_all just made it complete
+        have = {c["name"] for c in insp.get_columns(table.name)}
+        for col in table.columns:
+            if col.name in have:
+                continue
+            coltype = col.type.compile(dialect=conn.dialect)
+            ddl = f'ALTER TABLE "{table.name}" ADD COLUMN "{col.name}" {coltype}'
+            sd = getattr(col.server_default, "arg", None)
+            if sd is not None:  # a constant default lets SQLite back-fill existing rows
+                default_sql = str(getattr(sd, "text", sd))
+                ddl += (" NOT NULL" if not col.nullable else "") + f" DEFAULT {default_sql}"
+            try:
+                conn.exec_driver_sql(ddl)
+                log.info("warehouse: added missing column %s.%s", table.name, col.name)
+            except Exception as e:  # a partial/odd column must not abort startup
+                log.warning("warehouse: could not add %s.%s (%s)", table.name, col.name, e)
+
+
+def _create_missing_indexes(conn: Connection) -> None:
+    """Create any model-defined Index missing from an EXISTING SQLite table. ``create_all``
+    only builds indexes for tables it creates *fresh*, so a warehouse that predates an index
+    (e.g. ``uq_prices_change``, migration 0013) never gets it — which silently degrades the
+    ingest's ON CONFLICT idempotency on the desktop. For a UNIQUE index that fails on existing
+    duplicate rows, dedup (keep the lowest id) then retry — mirrors the alembic migration.
+    Each attempt is isolated in a SAVEPOINT so one failure can't poison the rest."""
+    import logging
+
+    from sqlalchemy import inspect
+    from sqlalchemy.exc import IntegrityError, OperationalError
+
+    from sportsdata_agents.data.base import Base
+
+    log = logging.getLogger(__name__)
+    insp = inspect(conn)
+    existing_tables = set(insp.get_table_names())
+    for table in Base.metadata.sorted_tables:
+        if table.name not in existing_tables:
+            continue
+        have = {ix["name"] for ix in insp.get_indexes(table.name)}
+        cols = {c["name"] for c in insp.get_columns(table.name)}
+        for index in table.indexes:
+            if index.name in have:
+                continue
+            idx_cols = [c.name for c in index.columns]
+            if not all(c in cols for c in idx_cols):
+                continue  # the columns themselves are missing — _add_missing_columns handles that
+            sp = conn.begin_nested()
+            try:
+                index.create(conn)
+                sp.commit()
+                log.info("warehouse: created missing index %s on %s", index.name, table.name)
+            except (IntegrityError, OperationalError):
+                sp.rollback()
+                if not (index.unique and "id" in cols):
+                    log.warning("warehouse: could not create index %s on %s", index.name, table.name)
+                    continue
+                grp = ", ".join(f'"{c}"' for c in idx_cols)
+                sp2 = conn.begin_nested()
+                try:
+                    conn.exec_driver_sql(
+                        f'DELETE FROM "{table.name}" WHERE id NOT IN '
+                        f'(SELECT MIN(id) FROM "{table.name}" GROUP BY {grp})'
+                    )
+                    index.create(conn)
+                    sp2.commit()
+                    log.info("warehouse: deduped + created unique index %s on %s", index.name, table.name)
+                except Exception as e:
+                    sp2.rollback()
+                    log.warning("warehouse: could not create unique index %s (%s)", index.name, e)
+
+
+async def ensure_schema(engine: AsyncEngine | None = None) -> None:
+    """Bring the desktop's self-contained SQLite warehouse up to the current ORM schema at
+    launch (no runtime alembic). ``create_all`` adds missing TABLES; ``_add_missing_columns``
+    adds missing COLUMNS to existing tables; ``_create_missing_indexes`` adds missing INDEXES
+    (incl. unique ones the Postgres path gets via alembic). Gated to SQLite so the
+    Postgres/server path stays alembic-managed and untouched."""
+    engine = engine or get_engine()
+    if not str(engine.url).startswith("sqlite"):
+        return  # server/Postgres schema is alembic's job, not create_all's
+    from sportsdata_agents.data import models  # noqa: F401 — registers tables on Base.metadata
+    from sportsdata_agents.data.base import Base
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_add_missing_columns)
+    # Indexes in their OWN transaction: a dedup/constraint hiccup can't undo the schema above.
+    async with engine.begin() as conn:
+        await conn.run_sync(_create_missing_indexes)
+
+
+@asynccontextmanager
+async def session_scope() -> AsyncIterator[AsyncSession]:
+    """Transactional session: commit on success, rollback on error."""
+    async with get_sessionmaker()() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+
+
+async def reset_engine() -> None:
+    """Dispose + clear the cached engine (mainly for tests / config reloads)."""
+    global _engine, _sessionmaker
+    if _engine is not None:
+        await _engine.dispose()
+    _engine = None
+    _sessionmaker = None

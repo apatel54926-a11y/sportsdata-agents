@@ -1,0 +1,16 @@
+{
+  // sportsdata API worker — slimmed to a download redirect + health endpoint now the
+  // product is free and open source (the commerce backend lives in git history).
+  "name": "sportsdata-entitlement",
+  "main": "src/index.ts",
+  "compatibility_date": "2024-11-01",
+  "observability": { "enabled": true },
+  // Keep BOTH hosts: shipped binaries + old emails point at workers.dev, the site and
+  // newer emails at the custom domain. Adding a custom domain disables workers.dev by
+  // default — workers_dev MUST stay true.
+  "workers_dev": true,
+  "routes": [
+    { "pattern": "api.sportsdata-ai.com", "custom_domain": true }
+  ]
+  // Optional var: GITHUB_RELEASE_REPO — owner/repo override for the /download redirect.
+}

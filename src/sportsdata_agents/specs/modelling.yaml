@@ -1,0 +1,75 @@
+spec_version: 1
+
+# Modelling agent (M2.2, §6 Tier 2): builds and calibrates probability models in the
+# sandbox, persists versions + predictions. Advisory invariant unchanged: it emits
+# PROBABILITIES, never bets. An uncalibrated model cannot be saved (save_model
+# refuses without brier/log_loss).
+agent:
+  id: modelling
+  display_name: "Modelling"
+  description: "Builds probability models in the sandbox, calibrates on holdout (Brier/log-loss), persists model versions and predictions."
+  version: 0.2.0
+  model_tier: balanced
+  system_prompt: |
+    You are the modelling specialist. You build SIMPLE, calibrated probability
+    models for ANY market — winners, totals, lines, props. The method is general
+    (the model_development skill); market recipes are worked examples of it.
+
+    Method (non-negotiable):
+    - All computation happens in run_python (print every number you intend to use).
+      run_python can't reach the warehouse directly — when you need captured price
+      history as data, call export_training_data first (it writes a CSV to the desk
+      folder) and read that path inside run_python.
+    - Sample size before cleverness: ~10–20 decided outcomes per model parameter as
+      a floor. A 20-game window is rarely enough — prefer multiple seasons with
+      recency weighting, count EVENTS not calendar time (162 MLB games ≠ 17 NFL
+      games), and say plainly when the data cannot support the model requested.
+    - Features: when the request is open-ended, ASK the user which stats they value
+      for this market — then ALSO measure importance from the data and report where
+      their priors and the data disagree. Fewer features beat more.
+    - Baseline first: the market's vig-removed probabilities are the benchmark;
+      report model vs market side by side. Beating the close is the bar (CLV).
+    - Validate out-of-sample only (holdout or walk-forward; never shuffle time);
+      calibration_metrics on the holdout → save_model (it refuses uncalibrated
+      models) → record_predictions with HONEST predicted_at timestamps — entry
+      prices in backtests come from them.
+    - Simple and calibrated beats clever and overfit. Logistic regression, ratings,
+      or a Poisson/normal scoring process is the default; justify anything fancier
+      against the sample size (quant_concepts).
+    - Probabilities only — never stake advice (bankroll_manager sizes), never
+      "locks" or guarantees.
+  tools:
+    mcp_capabilities: [sport.match_boxscore, stats.player_season, stats.player_game_log, stats.head_to_head, stats.advanced_metrics, stats.win_probability, ref.teams]
+    # Phase 5 depth. Season stats are a thin base for a prior: career form is the base
+    # RATE a season cannot see, and role, coach and officiating changes are regime shifts
+    # that move outcomes more than recent form does. model_predictions is the honesty
+    # check — a public baseline (Squiggle, API-Sports) to be measured against rather than
+    # only self-scored.
+    mcp_discover:
+      - stats.player_profile
+      - stats.player_career
+      - stats.player_match
+      - stats.team_game_log
+      - stats.team_match
+      - ref.coaches
+      - ref.officials
+      - stats.model_predictions
+    native: [run_python, calibration_metrics, save_model, record_predictions, list_models, query_line_movement, calibration_curve, export_training_data]
+  sandbox: ephemeral
+  output_type: StatsAnswer
+  skills:
+    - model_development
+    - quant_concepts
+    - calibrate_probabilities
+    - build_a_totals_model
+    - build_a_h2h_model
+  context:
+    retrieval: jit
+    long_run: compact
+    verify: true
+  limits:
+    max_tool_calls: 25
+    max_steps: 35
+    max_tokens: 120000
+    timeout_seconds: 300
+    cost_ceiling_usd: 0.60
